@@ -1,10 +1,8 @@
 import argparse
 import threading
 from concurrent import futures
-
 import grpc
 import numpy as np
-
 import federated_pb2
 import federated_pb2_grpc
 from common_fl import (
@@ -46,6 +44,14 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - servidor e cliente devem serializar no mesmo formato
         """
         # TODO: implemente a serialização do modelo para protobuf
+        
+        
+        coef, intercept = params
+        return federated_pb2.ModelParameters(
+            coef_values=coef.ravel().tolist(),
+            coef_shape=list(coef.shape),
+            intercept_values=intercept.ravel().tolist()
+        )
         raise NotImplementedError("Implemente _params_to_proto")
 
 
@@ -57,6 +63,11 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - mesma lógica do cliente em params_from_proto
         """
         # TODO: implemente a desserialização do protobuf para NumPy
+        
+        coef = np.array(proto_params.coef_values, dtype=np.float64).reshape(proto_params.coef_shape)
+        intercept = np.array(proto_params.intercept_values, dtype=np.float64)   
+        return [coef, intercept]
+        
         raise NotImplementedError("Implemente _proto_to_params")
 
     def GetGlobalModel(self, request, context):
@@ -67,10 +78,20 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - done deve ser True quando current_round > total_rounds
         - a mensagem pode ser algo como "Treinamento encerrado" ou "Modelo global disponível"
         """
+
         with self.lock:
             # TODO: calcule done
             # TODO: monte proto a partir dos parâmetros globais
             # TODO: retorne federated_pb2.GlobalModel(...)
+            done = self.current_round > self.total_rounds
+            message = "Treinamento encerrado" if done else "Modelo global disponível"
+            return federated_pb2.GlobalModel(
+                round=self.current_round,
+                total_rounds=self.total_rounds,
+                done=done,
+                message=message,
+                model=self._params_to_proto(self.global_params),
+            )
             raise NotImplementedError("Implemente GetGlobalModel")
 
     def _validate_update(self, request):
@@ -85,6 +106,14 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         Retorne uma tupla: (accepted: bool, message: str)
         """
         # TODO: implemente as quatro verificações acima
+
+        if self.current_round > self.total_rounds:
+            return False, "Treinamento já encerrado"
+        if request.round != self.current_round:
+            return False, f"Rodada inválida. Esperado: {self.current_round}, recebido: {request.round}"
+        if request.cid in self.received_updates:
+            return False, f"Cliente {request.cid} já enviou atualização nesta rodada"
+        return True, "OK"
         raise NotImplementedError("Implemente _validate_update")
 
 
@@ -103,7 +132,37 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
         - se a última rodada terminou, sinalizar training_finished
         """
         # TODO: implemente a consolidação da rodada
-        raise NotImplementedError("Implemente _consolidate_round_if_ready")
+        
+        if len(self.received_updates) != self.num_clients:
+            return
+
+        updates = list(self.received_updates.values())
+        self.global_params = aggregate_fedavg(updates)
+
+        loss, acc = evaluate_global_model(
+            self.global_params,
+            self.model_template,
+            self.X_test_global,
+            self.y_test_global,
+        )
+
+        avg_train_loss = sum(u["train_loss"] for u in updates) / len(updates)
+        avg_train_acc = sum(u["train_acc"] for u in updates) / len(updates)
+
+        print(
+            f"[Servidor] Rodada {self.current_round} consolidada — "
+            f"loss global: {loss:.4f}, acc global: {acc:.4f}, "
+            f"loss médio local: {avg_train_loss:.4f}, "
+            f"acc média local: {avg_train_acc:.4f}"
+        )
+
+        self.received_updates = {}
+        self.current_round += 1
+
+        if self.current_round > self.total_rounds:
+            self.training_finished.set()
+
+            raise NotImplementedError("Implemente _consolidate_round_if_ready")
 
 
     def SubmitUpdate(self, request, context):
@@ -129,7 +188,40 @@ class FederatedLearningServicer(federated_pb2_grpc.FederatedLearningServicer):
             # TODO: consolidar a rodada se todos os clientes já enviaram
 
             # TODO: retornar UpdateAck de sucesso
-            raise NotImplementedError("Implemente SubmitUpdate")
+
+
+
+              with self.lock:
+                accepted, message = self._validate_update(request)
+                if not accepted:
+                    return federated_pb2.UpdateAck(
+                        accepted=False,
+                        message=message,
+                        server_round=self.current_round,
+                    )
+
+                params = self._proto_to_params(request.model)
+                self.received_updates[request.cid] = {
+                    "params": params,
+                    "num_examples": request.num_examples,
+                    "train_loss": request.train_loss,
+                    "train_acc": request.train_acc,
+                }
+
+                print(
+                    f"[Servidor] Atualização recebida do cliente {request.cid} "
+                    f"para a rodada {request.round}."
+                )
+
+                self._consolidate_round_if_ready()
+
+                return federated_pb2.UpdateAck(
+                    accepted=True,
+                    message="Atualização aceita.",
+                    server_round=self.current_round,
+                )
+
+        raise NotImplementedError("Implemente SubmitUpdate")
 
 
 
